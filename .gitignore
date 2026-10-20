@@ -45,3 +45,4 @@ venv/
 _to_delete/
 .DS_Store
 agentcore/.cli/
+.venv312/
