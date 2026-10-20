@@ -370,10 +370,12 @@ def build_refund_agent() -> Agent:
     - Customer Tier Windows: Standard = 30 days, Premium = 60 days
     
     Steps:
-    1. Fetch Context: Call get_inventory_context using the provided session_id to retrieve the order details and customer tier facts.
+    1. Get Context: Call get_inventory_context using the provided session_id to retrieve the order details and customer tier facts.
     2. Verify Eligibility: Compare the order date against today's date and the allowed return window for the customer's specific tier.
-    3. Process Eligible Returns: If the customer is eligible, call initiate_refund with the customer_id, order_id, and reason to process the return and retrieve a reference number.
-    4. Handle Ineligible Returns: If the customer is NOT eligible, do NOT call initiate_refund. Instead, explicitly output the specific reason for denial (e.g., the order date is outside the return window).
+    3. Process Eligible Returns: If the customer is eligible, call initiate_refund with the customer_id, order_id, and reason to process 
+    the return and retrieve a reference number.
+    4. Handle Ineligible Returns: If the customer is NOT eligible, do NOT call initiate_refund. Instead, explicitly output the specific 
+    reason for denial (e.g., the order date is outside the return window).
 
     Strict Constraints:
     - Base all decisions strictly on the raw data returned by your tools.
@@ -413,35 +415,62 @@ def build_refund_agent() -> Agent:
         Returns:
             Confirmation dict with return_reference number and instructions
         """
+        # Import data untils to check eligibilty
         from datetime import datetime, timezone
+
+        # Access the orders using customer and order keys.
         table = dynamodb.Table(config.ORDERS_TABLE)
         key = {"customer_id": customer_id, "order_id": order_id}
+
+        # Read the latest order and customer info
         order = table.get_item(Key=key, ConsistentRead=True).get("Item")
         customer = dynamodb.Table(config.CUSTOMERS_TABLE).get_item(
             Key={"customer_id": customer_id}, ConsistentRead=True,
         ).get("Item")
+
+        # Error if the record is missing
         if not order or not customer:
             return {"error": "Order or customer not found; no return initiated."}
+
+        # Use existing return reference.
         if order.get("return_reference"):
             return {"return_reference": order["return_reference"],
                     "order_id": order_id, "status": order.get("return_status"),
                     "instructions": "A return request already exists."}
+
+        # Return window for customer tiers.
         windows = {"standard": 30, "premium": 60}
         tier = str(customer.get("tier", "")).lower()
+
+        # Make sure tier is present.
         if tier not in windows:
             return {"error": "Customer tier is missing or unsupported."}
+
+        # Transform date to UTC.
         try:
             order_date = datetime.fromisoformat(str(order["order_date"]).replace("Z", "+00:00")).date()
         except (KeyError, ValueError, TypeError):
             return {"error": "A valid order date is required."}
+
+        # Use UTC to calculate the number of days since the order was placed.
         age = (datetime.now(timezone.utc).date() - order_date).days
         if age < 0 or age > windows[tier]:
             return {"error": f"Order is outside the {windows[tier]}-day return window."}
+
+        # Check to see if the oreder status is - order delivered.
         if str(order.get("status", "")).lower() != "order delivered":
             return {"error": "Delivery has NOT been confirmed; no return has been initiated."}
+
+        # Send error message - a reason is needed for a return
         if not reason.strip():
             return {"error": "A return reason is required Please provide a reason."}
+
+        # Generate the return reference
         reference = f"RET-{uuid.uuid4().hex[:8].upper()}"
+
+        # Record the return only if the order still exists and has no
+        # return reference - preventing concurrent requests from 
+        # creating two returns for the same order.
         try:
             table.update_item(
                 Key=key,
@@ -457,6 +486,7 @@ def build_refund_agent() -> Agent:
                 },
             )
         except ClientError as error:
+        # Report a failed write condition.
             if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 return {"error": "Order changed or a return already exists; refresh the order."}
             raise
@@ -1569,7 +1599,7 @@ def configure_observability(runtime_arn: str) -> None:
     try:
         apply_observability_config(runtime_arn, logging_configuration)
     except Exception as error:
-        print(f"[Note] Observability configuration failed: {error}")
+        print(f"Observability configuration failed: {error}")
         return
     print(f"CloudWatch log group: {config.AGENT_LOG_GROUP}")
     print("X-Ray sampling rate: 100%")
